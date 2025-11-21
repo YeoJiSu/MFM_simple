@@ -193,7 +193,47 @@ def train(args):
     global_step = 0
     best_loss = float("inf")
 
-    for epoch in range(1, args.epochs + 1):
+    # JISU ADDED: Train Log CSV
+    log_path = os.path.join(args.output_dir, "train_log.csv")
+    if not os.path.exists(log_path):
+        with open(log_path, "w") as f:
+            f.write("epoch,avg_train_loss\n")
+
+    """
+    중간에 학습하다가 서버가 끊겨서, 모델 다시 이어서 학습시킬려고 작성한 코드입니다.
+    """
+     # ----- Resume -----
+    start_epoch = 7 # 미지 
+    best_loss = _maybe_load_best_loss(args.output_dir)  # 기존 best.pt 기준
+    if args.resume_from and os.path.isfile(args.resume_from):
+        print(f"[Resume] loading: {args.resume_from}")
+        ckpt = torch.load(args.resume_from, map_location="cpu")
+
+        # 모델 가중치
+        projector.load_state_dict(ckpt["projector"], strict=True)
+        if "vision" in ckpt:
+            try:
+                vision.load_state_dict(ckpt["vision"], strict=False)
+            except Exception as e:
+                print(f"[warn] vision load skipped: {e}")
+        if args.unfreeze_llm and "llm_decoder" in ckpt:
+            try:
+                llm_dec.load_state_dict(ckpt["llm_decoder"], strict=False)
+            except Exception as e:
+                print(f"[warn] llm_decoder load skipped: {e}")
+
+        # 옵티마이저 (파라미터 구성이 같아야 함)
+        try:
+            optimizer.load_state_dict(ckpt["optimizer"])
+            _optimizer_to(optimizer, device)
+        except Exception as e:
+            print(f"[warn] optimizer state not loaded: {e} (파라미터 구성이 달라졌을 수 있음)")
+
+        # 다음 에폭부터 재개
+        start_epoch = int(ckpt.get("epoch", 0)) + 1
+        print(f"[Resume] start_epoch = {start_epoch}, prev_avg_loss = {ckpt.get('avg_loss','?')}")
+
+    for epoch in range(start_epoch, args.epochs + 1):
         vision.train(args.unfreeze_vision)
         projector.train()
         llm_dec.train(args.unfreeze_llm)
@@ -270,8 +310,11 @@ def train(args):
 
         # ----- Epoch 끝: 체크포인트 -----
         avg_epoch = running / max(1, len(train_loader))
-        print(f"[Epoch {epoch}] avg_loss = {avg_epoch:.4f}")
+        print(f"[Epoch {epoch}] avg_loss = {avg_epoch:.15f}")
 
+        # JISU ADDED: Save train log
+        with open(log_path, "a") as f:
+            f.write(f"{epoch},{avg_epoch:.15f}\n")
         ckpt = {
             "epoch": epoch,
             "projector": projector.state_dict(),
@@ -295,6 +338,25 @@ def train(args):
             print(f"[Info] Best ckpt updated: {best_loss:.4f}")
 
     print("[Done] Training completed.")
+
+# Utils for checkpoint loading
+def _maybe_load_best_loss(output_dir: str) -> float:
+    best_path = os.path.join(output_dir, "best.pt")
+    if os.path.isfile(best_path):
+        try:
+            ck = torch.load(best_path, map_location="cpu")
+            return float(ck.get("avg_loss", float("inf")))
+        except Exception:
+            pass
+    return float("inf")
+
+def _optimizer_to(optimizer: torch.optim.Optimizer, device: torch.device):
+    for st in optimizer.state.values():
+        for k, v in list(st.items()):
+            if torch.is_tensor(v):
+                st[k] = v.to(device)
+
+
 
 # -----------------------
 # 아규먼트
@@ -338,6 +400,9 @@ def build_parser():
     p.add_argument("--unfreeze_vision", action="store_true")
     p.add_argument("--unfreeze_llm", action="store_true")
     p.add_argument("--save_vision", action="store_true", help="동결이어도 비전 상태를 체크포인트에 포함")
+
+    # resume 옵션 - 추가 학습할 때 사용하자.
+    p.add_argument("--resume_from", type=str, default="", help="epoch_xxx.pt 체크포인트 경로")
     return p
 
 if __name__ == "__main__":
